@@ -11,7 +11,7 @@ import type { RowDataPacket } from 'mysql2';
 import { z } from 'zod';
 import { env } from './config.js';
 import { db, rows, transaction } from './db.js';
-import { authenticate, clearSession, csrf, requireAdmin, setSession } from './auth.js';
+import { authenticate, clearSession, csrf, requireAdmin, requirePasswordChanged, setSession } from './auth.js';
 import { compareCandidates, parseWorkbook, type Candidate, type DatasetType } from './excel.js';
 import { dashboardData } from './dashboard.js';
 
@@ -36,21 +36,27 @@ const safe=(fn:(req:express.Request,res:express.Response)=>Promise<unknown>)=>(r
 app.get('/api/health',safe(async(_req,res)=>{await db.query('SELECT 1');res.json({ok:true});}));
 app.post('/api/auth/login',loginLimit,safe(async(req,res)=>{
   const data=z.object({email:z.string().email(),password:z.string().min(1).max(200)}).parse(req.body);
-  const users=await rows<(RowDataPacket&{id:number;email:string;password_hash:string;name:string;role:'admin'|'viewer';active:number;failed_attempts:number;locked_until:Date|null})[]>('SELECT * FROM users WHERE email=? LIMIT 1',[data.email.toLowerCase()]); const user=users[0];
+  const users=await rows<(RowDataPacket&{id:number;email:string;password_hash:string;name:string;role:'admin'|'viewer';active:number;must_change_password:number;failed_attempts:number;locked_until:Date|null})[]>('SELECT * FROM users WHERE email=? LIMIT 1',[data.email.toLowerCase()]); const user=users[0];
   if(!user||!user.active||user.locked_until&&new Date(user.locked_until)>new Date()||!await bcrypt.compare(data.password,user.password_hash)){
     if(user) await db.execute('UPDATE users SET failed_attempts=failed_attempts+1, locked_until=IF(failed_attempts+1>=5,DATE_ADD(NOW(),INTERVAL 15 MINUTE),locked_until) WHERE id=?',[user.id]);
     return res.status(401).json({error:'E-mail ou senha inválidos.'});
   }
-  await db.execute('UPDATE users SET failed_attempts=0,locked_until=NULL,last_login_at=NOW() WHERE id=?',[user.id]); const session={id:user.id,email:user.email,name:user.name,role:user.role};setSession(res,session);res.json({user:session});
+  await db.execute('UPDATE users SET failed_attempts=0,locked_until=NULL,last_login_at=NOW() WHERE id=?',[user.id]); const session={id:user.id,email:user.email,name:user.name,role:user.role,mustChangePassword:Boolean(user.must_change_password)};setSession(res,session);res.json({user:session});
 }));
 app.get('/api/auth/me',authenticate,(req,res)=>res.json({user:req.user}));
 app.post('/api/auth/logout',authenticate,csrf,(req,res)=>{clearSession(res);res.status(204).end();});
+app.post('/api/auth/change-password',authenticate,csrf,safe(async(req,res)=>{const data=z.object({currentPassword:z.string().min(1).max(200),newPassword:z.string().min(12).max(200)}).refine(x=>x.currentPassword!==x.newPassword,{message:'A nova senha deve ser diferente da senha atual.',path:['newPassword']}).parse(req.body);const users=await rows<(RowDataPacket&{password_hash:string})[]>('SELECT password_hash FROM users WHERE id=? LIMIT 1',[req.user!.id]);if(!users[0]||!await bcrypt.compare(data.currentPassword,users[0].password_hash))return res.status(400).json({error:'A senha atual está incorreta.'});const hash=await bcrypt.hash(data.newPassword,12);await db.execute('UPDATE users SET password_hash=?,must_change_password=FALSE,failed_attempts=0,locked_until=NULL WHERE id=?',[hash,req.user!.id]);const session={...req.user!,mustChangePassword:false};setSession(res,session);res.json({user:session});}));
 
-app.get('/api/dashboard',authenticate,safe(async(_req,res)=>res.json(await dashboardData())));
-app.get('/api/updates',authenticate,requireAdmin,safe(async(_req,res)=>{
+app.get('/api/users',authenticate,requirePasswordChanged,requireAdmin,safe(async(_req,res)=>{const users=await rows<(RowDataPacket&Record<string,unknown>)[]>('SELECT id,email,name,role,active,must_change_password,last_login_at,created_at FROM users ORDER BY name,email');res.json(users.map(({must_change_password,...user})=>({...user,mustChangePassword:Boolean(must_change_password)})));}));
+app.post('/api/users',authenticate,requirePasswordChanged,requireAdmin,csrf,safe(async(req,res)=>{const data=z.object({name:z.string().trim().min(2).max(120),email:z.string().email().max(190),role:z.enum(['admin','viewer']),temporaryPassword:z.string().min(12).max(200)}).parse(req.body);const hash=await bcrypt.hash(data.temporaryPassword,12);try{const[result]=await db.execute('INSERT INTO users(email,password_hash,name,role,active,must_change_password) VALUES(?,?,?,?,TRUE,TRUE)',[data.email.toLowerCase(),hash,data.name,data.role]);res.status(201).json({id:(result as {insertId:number}).insertId});}catch(error){if((error as {code?:string}).code==='ER_DUP_ENTRY')return res.status(409).json({error:'Já existe um usuário com este e-mail.'});throw error;}}));
+app.post('/api/users/:id/reset-password',authenticate,requirePasswordChanged,requireAdmin,csrf,safe(async(req,res)=>{const id=z.coerce.number().int().positive().parse(req.params.id);const data=z.object({temporaryPassword:z.string().min(12).max(200)}).parse(req.body);const hash=await bcrypt.hash(data.temporaryPassword,12);const[result]=await db.execute('UPDATE users SET password_hash=?,must_change_password=TRUE,failed_attempts=0,locked_until=NULL WHERE id=?',[hash,id]);if(!(result as {affectedRows:number}).affectedRows)return res.status(404).json({error:'Usuário não encontrado.'});res.status(204).end();}));
+app.patch('/api/users/:id/status',authenticate,requirePasswordChanged,requireAdmin,csrf,safe(async(req,res)=>{const id=z.coerce.number().int().positive().parse(req.params.id);const{active}=z.object({active:z.boolean()}).parse(req.body);if(id===req.user!.id&&!active)return res.status(400).json({error:'Você não pode inativar o próprio usuário.'});const[result]=await db.execute('UPDATE users SET active=?,failed_attempts=IF(?,failed_attempts,0),locked_until=IF(?,locked_until,NULL) WHERE id=?',[active,active,active,id]);if(!(result as {affectedRows:number}).affectedRows)return res.status(404).json({error:'Usuário não encontrado.'});res.status(204).end();}));
+
+app.get('/api/dashboard',authenticate,requirePasswordChanged,safe(async(_req,res)=>res.json(await dashboardData())));
+app.get('/api/updates',authenticate,requirePasswordChanged,requireAdmin,safe(async(_req,res)=>{
   const data=await rows<(RowDataPacket&Record<string,unknown>)[]>(`SELECT l.*,u.name AS performed_by_name FROM update_logs l JOIN users u ON u.id=l.performed_by ORDER BY l.created_at DESC LIMIT 100`);res.json(data);
 }));
-app.post('/api/uploads/preview',authenticate,requireAdmin,csrf,upload.single('file'),safe(async(req,res)=>{
+app.post('/api/uploads/preview',authenticate,requirePasswordChanged,requireAdmin,csrf,upload.single('file'),safe(async(req,res)=>{
   const type=z.enum(['teorico','pratico']).parse(req.body.type) as DatasetType; if(!req.file) return res.status(400).json({error:'Selecione uma planilha XLSX.'});
   const uploadedName=decodeUploadFilename(req.file.originalname);
   const normalizedName=comparableFilename(req.file.originalname);
@@ -63,7 +69,7 @@ app.post('/api/uploads/preview',authenticate,requireAdmin,csrf,upload.single('fi
   await db.execute(`INSERT INTO import_staging(id,dataset_type,filename,checksum,payload_json,comparison_json,created_by,expires_at) VALUES(?,?,?,?,?,?,?,DATE_ADD(NOW(),INTERVAL 30 MINUTE))`,[id,type,uploadedName,parsed.checksum,JSON.stringify(parsed.candidates),JSON.stringify(comparison),req.user!.id]);
   res.json({previewId:id,filename:uploadedName,comparison});
 }));
-app.post('/api/uploads/:id/commit',authenticate,requireAdmin,csrf,safe(async(req,res)=>{
+app.post('/api/uploads/:id/commit',authenticate,requirePasswordChanged,requireAdmin,csrf,safe(async(req,res)=>{
   const staged=await rows<(RowDataPacket&{id:string;dataset_type:DatasetType;filename:string;checksum:string;payload_json:string|Candidate[];comparison_json:string|ReturnType<typeof compareCandidates>})[]>('SELECT * FROM import_staging WHERE id=? AND created_by=? AND expires_at>NOW() LIMIT 1',[req.params.id,req.user!.id]); const item=staged[0];if(!item)return res.status(404).json({error:'Prévia inexistente ou expirada.'});
   const payload=typeof item.payload_json==='string'?JSON.parse(item.payload_json):item.payload_json; const comparison=typeof item.comparison_json==='string'?JSON.parse(item.comparison_json):item.comparison_json;
   await transaction(async conn=>{await conn.execute('UPDATE dataset_versions SET is_active=FALSE WHERE dataset_type=?',[item.dataset_type]);const [ins]=await conn.execute('INSERT INTO dataset_versions(dataset_type,filename,checksum,row_count,is_active,uploaded_by) VALUES(?,?,?,?,TRUE,?)',[item.dataset_type,item.filename,item.checksum,payload.length,req.user!.id]);const versionId=(ins as {insertId:number}).insertId;

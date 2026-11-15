@@ -3,9 +3,11 @@ export const migrations = [
     id BIGINT PRIMARY KEY AUTO_INCREMENT, email VARCHAR(190) NOT NULL UNIQUE,
     password_hash VARCHAR(100) NOT NULL, name VARCHAR(120) NOT NULL,
     role ENUM('admin','viewer') NOT NULL DEFAULT 'viewer', active BOOLEAN NOT NULL DEFAULT TRUE,
+    must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
     failed_attempts INT NOT NULL DEFAULT 0, locked_until DATETIME NULL,
     last_login_at DATETIME NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE AFTER active`,
   `CREATE TABLE IF NOT EXISTS dataset_versions (
     id BIGINT PRIMARY KEY AUTO_INCREMENT, dataset_type ENUM('teorico','pratico') NOT NULL,
     filename VARCHAR(255) NOT NULL, checksum CHAR(64) NOT NULL, row_count INT NOT NULL,

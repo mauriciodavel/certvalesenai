@@ -7,6 +7,8 @@ import Shell from "./components/Shell";
 import Dashboard from "./pages/Dashboard";
 import Updates from "./pages/Updates";
 import Participant from "./pages/Participant";
+import Users from "./pages/Users";
+import ChangePassword from "./pages/ChangePassword";
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -28,6 +30,8 @@ export default function App() {
         <Route path="*" element={<Login onLogin={setUser} />} />
       </Routes>
     );
+  if (user.mustChangePassword)
+    return <ChangePassword user={user} onChanged={setUser} onLogout={() => setUser(null)} />;
   return (
     <Shell user={user} onLogout={() => setUser(null)}>
       <Routes>
@@ -39,6 +43,7 @@ export default function App() {
           path="/atualizacoes"
           element={user.role === "admin" ? <Updates /> : <Navigate to="/gap" />}
         />
+        <Route path="/usuarios" element={user.role === "admin" ? <Users currentUserId={user.id} /> : <Navigate to="/gap" />} />
         <Route path="*" element={<Navigate to="/gap" />} />
       </Routes>
     </Shell>

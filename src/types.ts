@@ -3,6 +3,7 @@ export type User = {
   email: string;
   name: string;
   role: "admin" | "viewer";
+  mustChangePassword: boolean;
 };
 export type Summary = {
   average: number;
